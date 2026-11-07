@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, List, Mapping
 
 from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_metadata import (
-    ABSORBED_MESSAGE_UIDS, CANONICAL_ROW, DB_ROW_SNAPSHOT, MESSAGE_UID, RESTORED_FROM_STORE, TOOL_CALL_UIDS,
+    ABSORBED_MESSAGE_UIDS, CANONICAL_ROW, DB_ROW_SNAPSHOT, MESSAGE_UID, RESTORED_FROM_STORE, TOOL_CALL_UIDS, TYPED_ASK,
     copy_identity_fields, message_uid_or_none)
 from hermes_state_common import _id_chunks, _placeholders
 from hermes_state_identity import _fill_missing_tool_call_uids, _restore_row_identity
@@ -312,11 +312,17 @@ def _rewrite_row(
         ).fetchall()
     ] if old_identity is not None else []
 
-    # Owned columns only: same-process metadata writes (a reaction, a backfill) stay as committed.
+    # Owned columns only: same-process metadata writes (a reaction, a backfill) stay as committed. One exception:
+    # the typed-ask stamp names the content it was taken from, so new content whose live dict no longer carries it
+    # (a fold dropped it) removes it, or a reload would read the old ask for the merged row.
     assignments = ", ".join(f"{column} = ?" for column in _OWNED_COLUMNS)
+    stale_ask = (f"json_valid(display_metadata) AND json_extract(display_metadata, '$.{TYPED_ASK}') IS NOT NULL "
+                 f"AND content IS NOT ? AND json_extract(COALESCE(?, '{{}}'), '$.{TYPED_ASK}') IS NULL")
     conn.execute(
-        f"UPDATE messages SET {assignments} WHERE id = ? AND session_id = ?",
-        [*(serialized[column] for column in _OWNED_COLUMNS), int(target_row["id"]), session_id],
+        f"UPDATE messages SET {assignments}, display_metadata = CASE WHEN {stale_ask} "
+        f"THEN json_remove(display_metadata, '$.{TYPED_ASK}') ELSE display_metadata END WHERE id = ? AND session_id = ?",
+        [*(serialized[column] for column in _OWNED_COLUMNS), serialized["content"], serialized["display_metadata"],
+         int(target_row["id"]), session_id],
     )
     _restore_display_index(conn, session_id, target_row, serialized, old_identity, old_peer_ids)
 
